@@ -11,8 +11,9 @@ import streamlit as st
 from migration_engine import (
     SCENARIOS,
     PERMISSION_OPTIONS,
-    RECOVERY_STEPS,
+    SAFE_TEST_CRAWL_GUIDANCE,
     MigrationConfig,
+    generate_recovery_steps,
     simulate,
 )
 
@@ -330,10 +331,26 @@ with col_results:
 
         st.divider()
 
+        # -- Safe test crawl guidance ----------------------------------------
+        with st.expander(
+            "How to run a safer Databricks test crawl (recommended)",
+            expanded=False,
+        ):
+            st.markdown(
+                "Follow these steps **before touching your existing production "
+                "connection** — regardless of which migration scenario you "
+                "chose."
+            )
+            for i, step in enumerate(SAFE_TEST_CRAWL_GUIDANCE, 1):
+                st.markdown(f"{i}. {step}")
+
+        st.divider()
+
         # -- If something goes wrong -----------------------------------------
         st.markdown("#### If something goes wrong during migration")
-        for step in RECOVERY_STEPS:
-            st.markdown(f"- {step}")
+        recovery_steps = generate_recovery_steps(scenario)
+        for step in recovery_steps:
+            st.markdown(f"- **{step['heading']}** — {step['detail']}")
 
         st.divider()
 

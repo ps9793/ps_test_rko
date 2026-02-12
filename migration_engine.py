@@ -66,26 +66,104 @@ ASSET_TYPE_DISTRIBUTION: dict[str, float] = {
     "Queries / Notebooks": 0.10,
 }
 
-# Static recovery guidance
-RECOVERY_STEPS: list[str] = [
-    "Pause or stop the affected Databricks workflows in Atlan.",
+# Safe test crawl guidance (scenario-agnostic)
+SAFE_TEST_CRAWL_GUIDANCE: list[str] = [
     (
-        "If you repointed a connection and large portions of the estate "
-        "disappeared: revert the crawler configuration to the previous "
-        "hostname/workspace and re-run the workflow to restore catalog coverage."
+        "**Create a separate test connection** — In Atlan, create a new "
+        "Databricks connection pointing to the **new** workspace/hostname. "
+        'Give it a clear name like "Databricks – NEW TENANT – TEST ONLY".'
     ),
     (
-        "If you created a new connection and now see duplicates: decide which "
-        "connection is the \"source of truth\", temporarily disable schedules "
-        "on the non-canonical connection, and use search/filters to bulk-archive "
-        "or hide legacy assets once you're sure new ones are correct."
+        "**Scope it down** — Limit the connection filters to **1–2 "
+        "catalogs/schemas** that exist in both old and new environments. "
+        "Pick ones that are representative but not business-critical if possible."
     ),
     (
-        "If the tenant state looks corrupted or inconsistent: note the "
-        "approximate time of last \"good\" state, contact Atlan support and "
-        "reference tenant backup / restore as an option."
+        "**Run manually, once** — Do not schedule it yet. Run preflight "
+        "checks, then run the workflow once."
+    ),
+    (
+        "**Compare and interpret results** — Compare asset counts for those "
+        "catalogs between the old connection (current production) and the new "
+        "test connection. Spot-check that qualified names look consistent and "
+        "key tables appear once (not missing or duplicated)."
+    ),
+    (
+        "**Decide next step** — If the test looks good, expand scope (more "
+        "catalogs) or plan your production switch. If it looks off (missing "
+        "data, unexpected structure), fix issues with Databricks/workspace "
+        "configuration before touching the production connection."
     ),
 ]
+
+
+def generate_recovery_steps(scenario: str) -> list[dict[str, str]]:
+    """Return scenario-aware 'If something goes wrong' guidance.
+
+    Each item is a dict with 'heading' and 'detail' keys.
+    """
+    steps: list[dict[str, str]] = []
+
+    # Universal first step
+    steps.append({
+        "heading": "Stop the bleeding first",
+        "detail": (
+            "Pause or stop the affected Databricks workflows in Atlan "
+            "(both old and new connections) to avoid compounding issues."
+        ),
+    })
+
+    if scenario == SCENARIOS[0]:
+        # Hostname update — revert is straightforward
+        steps.append({
+            "heading": "If connectivity fails or assets look wrong after the hostname change",
+            "detail": (
+                "Revert the connection configuration to the **previous hostname** "
+                "(use the saved config/screenshot you took before cutover). "
+                "Re-run the workflow with the old config to confirm catalog "
+                "coverage returns to normal."
+            ),
+        })
+
+    elif scenario == SCENARIOS[1]:
+        # Re-point — the high-risk archive scenario
+        steps.append({
+            "heading": "If large portions of the estate disappeared after repointing",
+            "detail": (
+                "Revert the connection configuration to the **previous "
+                "hostname/workspace** (use the saved config/screenshot). "
+                "Re-run the workflow with the old config to restore catalog "
+                "coverage. Only after you see expected asset counts again "
+                "should you attempt a new migration approach."
+            ),
+        })
+
+    elif scenario == SCENARIOS[2]:
+        # New connection — duplicate risk
+        steps.append({
+            "heading": "If you see duplicates across old and new connections",
+            "detail": (
+                "Decide which connection is the **source of truth** (old vs "
+                "new). Temporarily disable schedules on the non-canonical "
+                "connection. Use search and filters (by connection, label, etc.) "
+                "to bulk-archive or hide legacy assets — but only after the new "
+                "connection is fully validated."
+            ),
+        })
+
+    # Universal last-resort step
+    steps.append({
+        "heading": "If the tenant state looks corrupted or inconsistent",
+        "detail": (
+            "Note the approximate time of the last \"good\" state. Contact "
+            "Atlan support and reference that Atlan maintains **daily tenant "
+            "backups**; ask about restoring to that timestamp as a last resort. "
+            "Communicate the potential impact and downtime to stakeholders "
+            "before proceeding with a restore."
+        ),
+    })
+
+    return steps
 
 
 # ---------------------------------------------------------------------------
@@ -298,19 +376,32 @@ def _generate_summary(cfg: MigrationConfig, result: ImpactResult) -> str:
             f"the **{cfg.current_assets:,}** existing assets."
         )
 
-    # Explain the primary risk type
-    if result.archived_assets > 0 and result.duplicated_assets == 0:
+    # Explain the primary risk type — scenario-aware emphasis
+    if cfg.scenario == SCENARIOS[0]:
+        # Hostname update: emphasize connectivity, not loss
+        parts.append(
+            "If the metastore and connection filters are unchanged, the primary "
+            "risk is around **connectivity and permissions** — not asset loss. "
+            "Assets should remain intact as long as the new hostname resolves "
+            "to the same Unity Catalog metastore."
+        )
+    elif result.archived_assets > 0 and result.duplicated_assets == 0:
+        # Re-point scenario: emphasize archive danger
         parts.append(
             "Because we are re-using the same connection and the new workspace "
             "has fewer assets, these assets are at risk of being **archived or "
-            "disappearing from the catalog**."
+            "disappearing from the catalog**. For a large estate, this can mean "
+            "losing visibility on a significant portion of assets in a single "
+            "crawl run."
         )
     elif result.duplicated_assets > 0 and result.archived_assets == 0:
+        # New connection: emphasize duplication + split enrichment
         parts.append(
-            "Existing curated assets may remain in place while new assets are "
-            "created under a new connection, leading to **duplicate tables, "
-            "models, dashboards, and split enrichment** unless enrichment is "
-            "deliberately migrated."
+            "Existing curated assets remain in place while new assets are "
+            "created under a separate connection, leading to **duplicate "
+            "tables, models, dashboards, and split enrichment**. The primary "
+            "challenge is managing the overlap period and migrating enrichment "
+            "(tags, descriptions, owners) from old to new assets."
         )
     elif result.archived_assets > 0 and result.duplicated_assets > 0:
         parts.append(
@@ -358,71 +449,107 @@ def _generate_recommendations(
 
     # -- Scenario-specific advice ----------------------------------------------
     if scenario == SCENARIOS[0]:
+        # --- Scenario 1: Update hostname/URL (same metastore) -----------------
         recs.append(
-            "Confirm same metastore and same crawler filters before making the "
-            "hostname change."
+            "**Validate assumptions before changing anything in prod** — "
+            "Confirm with the Databricks team that the Unity Catalog metastore "
+            "ID stays the same and the same catalogs/schemas/tables will remain "
+            "available. In Atlan, confirm the connection filters "
+            "(catalogs/schemas) won't change."
         )
         recs.append(
-            "Run a small test crawl (1–2 catalogs) against the new hostname "
-            "first to verify connectivity and permissions."
+            "**Run a small test crawl on a separate connection first** — Do "
+            "**not** point the existing production connection to a test URL. "
+            "Instead, create a **new Databricks connection** pointing at the "
+            "new hostname, limit filters to 1–2 low-risk catalogs/schemas, and "
+            "run the workflow once manually with scheduling turned off. Compare "
+            "asset counts and qualified names vs. the old connection for those "
+            "catalogs."
         )
         recs.append(
-            "Have a rollback plan ready: revert the hostname in the crawler "
-            "configuration if the test crawl reveals problems."
+            "**Plan the production switch** — Schedule a short migration "
+            "window. Before editing the production connection, capture the "
+            "current connection configuration (screenshot or JSON) and the last "
+            "successful run time. Communicate to downstream teams that a brief "
+            "refresh gap might occur."
+        )
+        recs.append(
+            "**Cut over with a clear rollback** — Update the hostname on the "
+            "existing connection. Run preflight + a limited-scope run first "
+            "(not the full estate). If something looks wrong (missing catalogs, "
+            "failures), revert the hostname to the previous value and re-run "
+            "the workflow to restore previous behavior."
         )
 
     elif scenario == SCENARIOS[1]:
+        # --- Scenario 2: Re-point existing connection -------------------------
         recs.append(
-            "Re-pointing the existing connection will **archive everything "
-            "not present in the new workspace**. Understand exactly which "
-            "assets will disappear."
-        )
-        if cfg.interim_subset:
-            recs.append(
-                "**Avoid repointing to an interim workspace** with a strict "
-                "subset of the final catalogs if possible. Instead, repoint "
-                "directly from the old workspace to the final workspace when "
-                "ready. If interim is unavoidable, document which assets will "
-                "disappear and socialize that with downstream users."
-            )
-        else:
-            recs.append(
-                "Prefer repointing directly to the **final** workspace to "
-                "avoid multiple rounds of archive churn."
-            )
-        recs.append(
-            "Take an asset-export or MDLH extract of key enriched assets "
-            "(tags, descriptions, owners) before making the change."
+            "**Treat this as a high-risk operation** — Re-using the same "
+            "connection and pointing it to a workspace with fewer assets will "
+            "likely **archive everything that no longer appears in the new "
+            "workspace**. For a large estate, this can mean losing visibility "
+            "on hundreds of thousands of assets in a single crawl."
         )
         recs.append(
-            "Document which assets will be temporarily archived and set "
-            "expectations with downstream consumers before cutover."
+            "**Do not repoint your existing production connection to an "
+            "interim workspace** that has only a subset of catalogs. Instead, "
+            "either wait until the **final** workspace is fully ready, or use "
+            "**Scenario 3 (new connection)** plus controlled enrichment "
+            "migration to avoid any archival churn."
+        )
+        recs.append(
+            "**If you still must use this scenario, follow a strict plan** — "
+            "First, ensure a **separate test connection** has already validated "
+            "that the new workspace exposes the full set of required assets. "
+            "Then restrict the first production run to a smaller set of "
+            "catalogs to verify behavior before scanning the entire estate. "
+            "Communicate clearly that assets not present in the new workspace "
+            "will be archived in Atlan."
+        )
+        recs.append(
+            "**Treat tenant backups as a last resort, not the primary plan** — "
+            "Atlan keeps **daily backups** of the tenant and, in a worst-case "
+            "scenario, support can restore to the last known good point. "
+            "However, this is a **time-consuming operation** and should not be "
+            "used as a substitute for safe testing and planning."
         )
         if not cfg.same_metastore:
             recs.append(
-                "Metastore is also changing — assets may get new qualified "
-                "names and lose enrichment. Plan an enrichment migration."
+                "**Metastore is also changing** — Assets may get new qualified "
+                "names and lose enrichment. Plan an enrichment migration "
+                "(asset-export / MDLH) before cutting over."
             )
 
     elif scenario == SCENARIOS[2]:
+        # --- Scenario 3: New connection in parallel ---------------------------
         recs.append(
-            "This approach is safer from a \"loss\" perspective (existing "
-            "assets stay in place) but can cause **duplicates and split "
-            "enrichment** if the old and new connections overlap."
+            "**Stand up the new connection in parallel** — Create a new "
+            "Databricks connection pointing to the new workspace. Start with a "
+            "limited scope (e.g., 1–2 critical catalogs). Run the workflow "
+            "manually and confirm that counts & structures match expectations "
+            "and permissions and Unity Catalog behavior are correct."
         )
         recs.append(
-            "Run the new connection in parallel in non-prod or as a separate "
-            "connection first. Validate asset counts and coverage before "
-            "making it the primary connection."
+            "**Gradually expand scope and compare results** — Increase filters "
+            "to include more catalogs/schemas. Compare total asset counts "
+            "between old vs. new for a few key domains, and spot-check a small "
+            "sample of business-critical tables/views."
         )
         recs.append(
-            "Use asset-export / MDLH to map enrichment from old to new "
-            "qualified names if needed."
+            "**Plan enrichment & user migration** — Clearly label the new "
+            "connection as the future \"source of truth\". Optionally use "
+            "Atlan's enrichment migration options (asset-export / MDLH) to "
+            "export enrichment for overlapping assets from the old connection "
+            "and re-apply to the new assets once validated. Communicate a "
+            "timeline for when users should switch and when the old connection "
+            "will be frozen and eventually retired."
         )
         recs.append(
-            "Plan a deprecation/cleanup phase: lock or retire the old "
-            "connection, then archive or hide legacy assets once users have "
-            "moved to the new connection."
+            "**Clean up duplicates carefully** — Once the new connection is "
+            "stable and validated, turn off schedules on the old connection. "
+            "Use filters (by connection, label, or source) to bulk-archive or "
+            "hide legacy assets. Make sure teams have confirmed they are no "
+            "longer using the old assets before final cleanup."
         )
 
     # -- Closing recommendation ------------------------------------------------
