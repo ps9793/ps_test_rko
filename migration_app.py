@@ -181,7 +181,7 @@ with col_input:
         new_assets = current_assets
 
     # Overlap slider: only for "Create new connection" scenario
-    overlap_pct: float | None = None
+    overlap_pct = None
     if scenario == SCENARIOS[2]:
         overlap_raw = st.slider(
             "Approx. % of existing assets that will also appear in the new workspace",
