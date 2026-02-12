@@ -203,7 +203,8 @@ def _compute_scores(
 
     # -- Direct impact -------------------------------------------------------
     affected_frac = (archived + duplicated) / current
-    direct = affected_frac * 60.0 + crit_frac * 40.0
+    # Criticality only matters proportional to what's actually affected
+    direct = affected_frac * (60.0 + crit_frac * 40.0)
     # Bump for prod environments
     if cfg.environment == "Prod":
         direct *= 1.15
@@ -212,15 +213,20 @@ def _compute_scores(
     direct = _clamp(direct)
 
     # -- Transitive impact ---------------------------------------------------
-    # Larger estates have more transitive fanout.
+    # Transitive fanout only exists when something is directly affected.
     scale_factor = min(math.log10(max(current, 10)) / 7.0, 1.0)  # log10(10M)~7
-    transitive = (scale_factor * 50.0) + (crit_frac * 30.0) + (affected_frac * 20.0)
+    if affected_frac > 0:
+        transitive = (scale_factor * 50.0) + (crit_frac * 30.0) + (affected_frac * 20.0)
+    else:
+        transitive = 0.0
     transitive = _clamp(transitive)
 
     # -- Overall risk --------------------------------------------------------
+    # Base risk scales with actual impact — a no-op migration is near-zero.
     base = SCENARIO_BASE_RISK.get(cfg.change_type, 0.5)
+    impact_factor = max(min(affected_frac * 3.0, 1.0), 0.10)
     overall = (
-        base * 40.0
+        base * 40.0 * impact_factor
         + direct * 0.35
         + transitive * 0.25
     )
