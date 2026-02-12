@@ -6,6 +6,25 @@ workspace / tenant migration on an existing Atlan Databricks connector.
 
 All data is mocked for the hackathon. The interface is designed so each
 function can be swapped for real Atlan API calls later.
+
+## Risk Model Summary
+────────────────────
+Inputs used:
+  - current_assets, new_assets, scenario, same_metastore, is_prod,
+    overlap_pct (new-connection only), crawler_perms, interim_subset.
+
+Risk formula (integer 0–100):
+  risk = base(scenario) + 40*lost_pct + 40*dup_pct + prod_bonus + perms_adj
+  where:
+    base = 20 (hostname) | 55 (re-point) | 65 (new connection)
+    lost_pct  = archived_assets / current_assets
+    dup_pct   = duplicated_assets / current_assets
+    prod_bonus = +10 if production tenant
+    perms_adj  = +5 (narrower) | -5 (broader) | 0 (same)
+
+When duplicated_assets > 0:
+  Only in the "Create new Databricks connection" scenario AND
+  same_metastore == True AND overlap_pct > 0.
 """
 
 from __future__ import annotations
@@ -17,27 +36,25 @@ from dataclasses import dataclass, field
 # Constants
 # ---------------------------------------------------------------------------
 
-CHANGE_TYPES = [
-    "Update hostname in existing connection",
-    "Point existing connection to new workspace",
-    "Create new Databricks connection for new workspace",
+SCENARIOS = [
+    "Update hostname/URL on existing connection (same metastore)",
+    "Point existing connection to new workspace (same metastore)",
+    "Create new Databricks connection to new workspace",
 ]
 
-# Short labels used in the UI and summary text
-CHANGE_TYPE_LABELS: dict[str, str] = {
-    CHANGE_TYPES[0]: "Hostname update",
-    CHANGE_TYPES[1]: "Re-point existing connection",
-    CHANGE_TYPES[2]: "New connection",
+SCENARIO_LABELS: dict[str, str] = {
+    SCENARIOS[0]: "Hostname update",
+    SCENARIOS[1]: "Re-point existing connection",
+    SCENARIOS[2]: "New connection",
 }
 
-ENVIRONMENTS = ["Prod", "Non-prod", "Mixed"]
 PERMISSION_OPTIONS = ["same", "broader", "narrower"]
 
-# Base risk multipliers per scenario (0.0–1.0 scale)
-SCENARIO_BASE_RISK: dict[str, float] = {
-    CHANGE_TYPES[0]: 0.15,  # hostname only — low structural risk
-    CHANGE_TYPES[1]: 0.55,  # re-point — moderate, depends on workspace delta
-    CHANGE_TYPES[2]: 0.70,  # new connection — duplication + migration risk
+# Base risk per scenario (0–100 scale)
+SCENARIO_BASE: dict[str, int] = {
+    SCENARIOS[0]: 20,
+    SCENARIOS[1]: 55,
+    SCENARIOS[2]: 65,
 }
 
 # Mocked asset-type distribution (% of total estate)
@@ -48,6 +65,27 @@ ASSET_TYPE_DISTRIBUTION: dict[str, float] = {
     "Models (ML / dbt)": 0.10,
     "Queries / Notebooks": 0.10,
 }
+
+# Static recovery guidance
+RECOVERY_STEPS: list[str] = [
+    "Pause or stop the affected Databricks workflows in Atlan.",
+    (
+        "If you repointed a connection and large portions of the estate "
+        "disappeared: revert the crawler configuration to the previous "
+        "hostname/workspace and re-run the workflow to restore catalog coverage."
+    ),
+    (
+        "If you created a new connection and now see duplicates: decide which "
+        "connection is the \"source of truth\", temporarily disable schedules "
+        "on the non-canonical connection, and use search/filters to bulk-archive "
+        "or hide legacy assets once you're sure new ones are correct."
+    ),
+    (
+        "If the tenant state looks corrupted or inconsistent: note the "
+        "approximate time of last \"good\" state, contact Atlan support and "
+        "reference tenant backup / restore as an option."
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -60,13 +98,12 @@ class MigrationConfig:
 
     current_assets: int
     new_assets: int
-    change_type: str
-    environment: str  # "Prod" | "Non-prod" | "Mixed"
-    high_criticality_pct: float  # 0–100
+    scenario: str              # one of SCENARIOS
     same_metastore: bool
-    reuse_connection: bool  # derived from change_type in UI
-    crawler_perms: str  # "same" | "broader" | "narrower"
-    interim_workspace: bool  # True if strict subset of final catalogs
+    is_prod: bool
+    overlap_pct: float | None  # 0–1, used only for new-connection scenario
+    crawler_perms: str         # "same" | "broader" | "narrower"
+    interim_subset: bool
     customer_notes: str = ""
 
 
@@ -76,7 +113,6 @@ class AffectedAssetGroup:
 
     asset_type: str
     estimated_count: int
-    pct_high_criticality: float  # 0–100
 
 
 @dataclass
@@ -84,23 +120,24 @@ class ImpactResult:
     """Everything the UI needs to render the results panel."""
 
     # Core counts
-    estimated_archived_assets: int = 0
-    estimated_duplicated_assets: int = 0
-    estimated_preserved_assets: int = 0
+    archived_assets: int = 0
+    duplicated_assets: int = 0
+    preserved_assets: int = 0
 
-    # Scores (0–100)
-    direct_impact_score: float = 0.0
-    transitive_impact_score: float = 0.0
-    overall_risk_score: float = 0.0
-    risk_level: str = "Low"  # Low | Medium | High | Critical
+    # Scores (0–100, integer)
+    risk_score: int = 0
+    direct_impact_score: int = 0
+    transitive_impact_score: int = 0
+    risk_level: str = "Low"  # Low | Medium | High
 
     # Human-readable outputs
     summary: str = ""
     recommendations: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     affected_groups: list[AffectedAssetGroup] = field(default_factory=list)
 
     # Echo back for display
-    change_type_label: str = ""
+    scenario_label: str = ""
     customer_notes: str = ""
 
 
@@ -112,198 +149,188 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, value))
 
 
-def _risk_level(score: float) -> str:
-    """Map a 0-100 score to a human label."""
-    if score >= 75:
-        return "Critical"
-    if score >= 50:
+def _risk_level(score: int) -> str:
+    if score > 60:
         return "High"
-    if score >= 25:
+    if score >= 30:
         return "Medium"
     return "Low"
 
 
-def _compute_asset_counts(cfg: MigrationConfig) -> tuple[int, int, int]:
+def _compute_asset_counts(cfg: MigrationConfig) -> tuple[int, int, int, list[str]]:
     """Estimate archived / duplicated / preserved asset counts.
 
-    The logic branches by scenario and then applies modifiers for
-    metastore sameness, permissions, and asset-count deltas.
+    Returns (archived, duplicated, preserved, notes).
     """
-    current = cfg.current_assets
-    new = cfg.new_assets
-    change = cfg.change_type
+    total = cfg.current_assets
+    new = min(cfg.new_assets, total)
+    scenario = cfg.scenario
+    notes: list[str] = []
 
     archived = 0
     duplicated = 0
-    preserved = current  # optimistic default
+    preserved = total
 
-    # --- Scenario 1: Update hostname in existing connection -----------------
-    if change == CHANGE_TYPES[0]:
-        # Same connection, just URL change. Low risk unless perms narrower.
-        if cfg.crawler_perms == "narrower":
-            loss_pct = 0.10  # ~10% lost to narrower perms
-            archived = int(current * loss_pct)
-        # Metastore change adds some risk even for hostname updates
+    # --- Scenario 1: Update hostname/URL on existing connection ----------------
+    if scenario == SCENARIOS[0]:
+        archived = 0
+        duplicated = 0
+        preserved = total
         if not cfg.same_metastore:
-            extra_archive = int(current * 0.10)
-            archived = min(archived + extra_archive, current)
-        preserved = current - archived
+            notes.append(
+                "You selected 'Update hostname' but indicated the metastore "
+                "is changing. This is unusual — a hostname change with a "
+                "different metastore may cause unexpected asset loss."
+            )
 
-    # --- Scenario 2: Point existing connection to new workspace -------------
-    elif change == CHANGE_TYPES[1]:
-        # Assets in Atlan but not in the new workspace get archived.
-        if new < current:
-            archived = current - new
-        preserved = current - archived
-        # Metastore change amplifies risk
-        if not cfg.same_metastore:
-            extra_archive = int(current * 0.15)
-            archived = min(archived + extra_archive, current)
-            preserved = current - archived
+    # --- Scenario 2: Point existing connection to new workspace ----------------
+    elif scenario == SCENARIOS[1]:
+        preserved = new
+        archived = max(0, total - new)
+        duplicated = 0
+        if cfg.interim_subset:
+            notes.append(
+                "This is an interim workspace with a strict subset of the "
+                "final catalogs. Archived assets are temporary but high-risk — "
+                "downstream users will lose visibility until the final workspace "
+                "is connected."
+            )
 
-    # --- Scenario 3: Create new Databricks connection -----------------------
-    elif change == CHANGE_TYPES[2]:
-        if cfg.same_metastore:
-            # Same metastore → duplication from overlapping assets
-            overlap = min(current, new)
-            duplicated = overlap
-            preserved = current  # old connection untouched
+    # --- Scenario 3: Create new Databricks connection --------------------------
+    elif scenario == SCENARIOS[2]:
+        overlap = cfg.overlap_pct if cfg.overlap_pct is not None else 0.0
+        if cfg.same_metastore and overlap > 0:
+            duplicated = round(total * overlap)
         else:
-            # Different metastore → maximum structural change
-            preserved_pct = 0.05
-            preserved = int(current * preserved_pct)
-            archived = current - preserved
-            duplicated = new  # new connection creates a parallel set
+            duplicated = 0
+        archived = 0
+        preserved = total
+        if not cfg.same_metastore:
+            notes.append(
+                "New connection with a different metastore — Atlan will treat "
+                "all assets as brand-new entities. No duplicates, but lineage "
+                "continuity will break unless you plan explicit qualified-name "
+                "mappings."
+            )
 
-    # --- Permissions modifier (across all scenarios) ------------------------
-    if cfg.crawler_perms == "narrower" and change != CHANGE_TYPES[0]:
-        extra_archive = int(current * 0.05)
-        archived = min(archived + extra_archive, current)
-        preserved = current - archived
-
-    return archived, duplicated, preserved
+    return archived, duplicated, preserved, notes
 
 
 def _compute_scores(
     cfg: MigrationConfig,
     archived: int,
     duplicated: int,
-) -> tuple[float, float, float]:
-    """Compute direct_impact, transitive_impact, and overall risk scores.
+) -> tuple[int, int, int]:
+    """Compute risk_score, direct_impact_score, transitive_impact_score.
 
-    Direct impact  — based on the volume of immediately affected assets
-                     plus the high-criticality %.
-    Transitive     — penalty for large estates where many assets are
-                     multiple hops from the source (modeled simply as
-                     f(total_assets, high_crit_pct)).
-    Overall        — weighted combination plus scenario base risk.
+    All returned as integers 0–100.
     """
-    current = max(cfg.current_assets, 1)
-    crit_frac = cfg.high_criticality_pct / 100.0
+    total = max(cfg.current_assets, 1)
 
-    # -- Direct impact -------------------------------------------------------
-    affected_frac = (archived + duplicated) / current
-    # Criticality only matters proportional to what's actually affected
-    direct = affected_frac * (60.0 + crit_frac * 40.0)
-    # Bump for prod environments
-    if cfg.environment == "Prod":
-        direct *= 1.15
-    elif cfg.environment == "Mixed":
-        direct *= 1.05
-    direct = _clamp(direct)
+    lost_pct = archived / total
+    dup_pct = duplicated / total
 
-    # -- Transitive impact ---------------------------------------------------
-    # Transitive fanout only exists when something is directly affected.
-    scale_factor = min(math.log10(max(current, 10)) / 7.0, 1.0)  # log10(10M)~7
-    if affected_frac > 0:
-        transitive = (scale_factor * 50.0) + (crit_frac * 30.0) + (affected_frac * 20.0)
-    else:
-        transitive = 0.0
-    transitive = _clamp(transitive)
+    # --- Overall risk score ---------------------------------------------------
+    base = SCENARIO_BASE.get(cfg.scenario, 50)
+    loss_component = 40.0 * lost_pct
+    dup_component = 40.0 * dup_pct
+    prod_component = 10.0 if cfg.is_prod else 0.0
 
-    # -- Overall risk --------------------------------------------------------
-    # Base risk scales with actual impact — a no-op migration is near-zero.
-    base = SCENARIO_BASE_RISK.get(cfg.change_type, 0.5)
-    impact_factor = max(min(affected_frac * 3.0, 1.0), 0.10)
-    overall = (
-        base * 40.0 * impact_factor
-        + direct * 0.35
-        + transitive * 0.25
-    )
-    # Metastore change is a strong risk amplifier
-    if not cfg.same_metastore:
-        overall += 10.0
-    # Not reusing connection raises duplication risk
-    if not cfg.reuse_connection:
-        overall += 5.0
-    overall = _clamp(round(overall, 1))
+    perms_component = 0.0
+    if cfg.crawler_perms == "narrower":
+        perms_component = 5.0
+    elif cfg.crawler_perms == "broader":
+        perms_component = -5.0
 
-    return round(direct, 1), round(transitive, 1), overall
+    risk_raw = base + loss_component + dup_component + prod_component + perms_component
+    risk_score = int(max(0, min(100, round(risk_raw))))
+
+    # --- Direct impact score --------------------------------------------------
+    # Driven primarily by the fraction of assets lost or duplicated.
+    direct_raw = (lost_pct + dup_pct) * 80.0 + prod_component
+    direct_score = int(max(0, min(100, round(direct_raw))))
+
+    # --- Transitive impact score ----------------------------------------------
+    # Slightly lower than direct; scaled by estate size (log heuristic).
+    scale = min(math.log10(max(total, 10)) / 7.0, 1.0)
+    transitive_raw = direct_raw * 0.7 * scale
+    transitive_score = int(max(0, min(100, round(transitive_raw))))
+
+    return risk_score, direct_score, transitive_score
 
 
 def _build_affected_groups(
-    total_affected: int,
-    high_crit_pct: float,
+    archived: int,
+    duplicated: int,
+    preserved: int,
 ) -> list[AffectedAssetGroup]:
-    """Create mocked asset-type breakdown proportional to total affected."""
+    """Create mocked asset-type breakdown proportional to affected assets."""
+    total_affected = archived + duplicated
     groups: list[AffectedAssetGroup] = []
     for asset_type, frac in ASSET_TYPE_DISTRIBUTION.items():
         count = int(total_affected * frac)
         if count == 0 and total_affected > 0:
-            count = 1  # show at least 1 so the row appears
-        groups.append(
-            AffectedAssetGroup(
-                asset_type=asset_type,
-                estimated_count=count,
-                pct_high_criticality=round(high_crit_pct, 1),
-            )
-        )
+            count = 1
+        groups.append(AffectedAssetGroup(asset_type=asset_type, estimated_count=count))
     return groups
 
 
-def _generate_summary(
-    cfg: MigrationConfig,
-    result: ImpactResult,
-) -> str:
+def _generate_summary(cfg: MigrationConfig, result: ImpactResult) -> str:
     """Produce a plain-English blast-radius summary paragraph."""
-    label = CHANGE_TYPE_LABELS.get(cfg.change_type, cfg.change_type)
-    affected_total = result.estimated_archived_assets + result.estimated_duplicated_assets
-    affected_pct = (
-        round(affected_total / max(cfg.current_assets, 1) * 100, 1)
-    )
-    crit_pct = cfg.high_criticality_pct
+    label = SCENARIO_LABELS.get(cfg.scenario, cfg.scenario)
+    total = max(cfg.current_assets, 1)
+    affected_total = result.archived_assets + result.duplicated_assets
+    affected_pct = round(affected_total / total * 100)
 
     parts: list[str] = []
-    parts.append(
-        f"**{label}** migration scenario selected."
-    )
-    parts.append(
-        f"Expected to affect **~{affected_total:,}** of "
-        f"**{cfg.current_assets:,}** existing assets "
-        f"(**{affected_pct}%** of the estate)."
-    )
-    if crit_pct > 0:
+
+    parts.append(f"**{label}** scenario selected.")
+
+    if affected_total > 0:
         parts.append(
-            f"Of those, **{crit_pct}%** are flagged as high-criticality."
+            f"This change is expected to affect approximately "
+            f"**{affected_total:,} of {cfg.current_assets:,} existing assets "
+            f"({affected_pct}%)**."
+        )
+    else:
+        parts.append(
+            f"This change is expected to have **minimal structural impact** on "
+            f"the **{cfg.current_assets:,}** existing assets."
         )
 
-    if result.estimated_archived_assets > 0:
+    # Explain the primary risk type
+    if result.archived_assets > 0 and result.duplicated_assets == 0:
         parts.append(
-            f"An estimated **{result.estimated_archived_assets:,}** assets "
-            f"may be **archived or lost** from the catalog."
+            "Because we are re-using the same connection and the new workspace "
+            "has fewer assets, these assets are at risk of being **archived or "
+            "disappearing from the catalog**."
         )
-    if result.estimated_duplicated_assets > 0:
+    elif result.duplicated_assets > 0 and result.archived_assets == 0:
         parts.append(
-            f"An estimated **{result.estimated_duplicated_assets:,}** assets "
-            f"may appear as **duplicates** under the new connection."
+            "Existing curated assets may remain in place while new assets are "
+            "created under a new connection, leading to **duplicate tables, "
+            "models, dashboards, and split enrichment** unless enrichment is "
+            "deliberately migrated."
         )
+    elif result.archived_assets > 0 and result.duplicated_assets > 0:
+        parts.append(
+            "This scenario carries both **archive risk** (assets disappearing) "
+            "and **duplication risk** (overlapping assets under different "
+            "connections)."
+        )
+
+    env = "production" if cfg.is_prod else "non-production"
     parts.append(
-        f"Overall risk score: **{result.overall_risk_score}/100** "
-        f"({result.risk_level})."
+        f"Overall risk score: **{result.risk_score}/100 ({result.risk_level})** "
+        f"for this {env} tenant."
     )
+
+    # Append any engine notes
+    for note in result.notes:
+        parts.append(f"*Note: {note}*")
 
     if cfg.customer_notes:
-        parts.append(f'  \nCustomer notes: *"{cfg.customer_notes}"*')
+        parts.append(f'Customer notes: *"{cfg.customer_notes}"*')
 
     return "  \n".join(parts)
 
@@ -312,112 +339,96 @@ def _generate_recommendations(
     cfg: MigrationConfig,
     result: ImpactResult,
 ) -> list[str]:
-    """Return 3-5 actionable recommendations tailored to the scenario."""
+    """Return actionable recommendations tailored to the scenario and risk."""
     recs: list[str] = []
-    change = cfg.change_type
+    scenario = cfg.scenario
 
-    # -- Universal high-risk preamble ----------------------------------------
-    if result.risk_level == "Critical":
+    # -- Risk preamble ---------------------------------------------------------
+    if result.risk_level == "High":
         recs.append(
-            "This migration is rated **Critical risk**. "
-            "Do not proceed without a detailed migration plan reviewed by "
-            "both the customer's data-platform team and Atlan support."
+            "This migration is rated **High risk**. Schedule a dedicated "
+            "migration window and notify all downstream asset owners before "
+            "proceeding."
         )
-    elif result.risk_level == "High":
+    elif result.risk_level == "Medium":
         recs.append(
-            "This migration is rated **High risk**. "
-            "Schedule a dedicated migration window and notify all downstream "
-            "asset owners before proceeding."
-        )
-
-    # -- Scenario-specific advice --------------------------------------------
-    if change == CHANGE_TYPES[0]:
-        # Hostname update
-        recs.append(
-            "Risk is mainly around **connectivity and permissions**. "
-            "Validate with a small test crawl after updating the hostname."
-        )
-        if cfg.crawler_perms == "narrower":
-            recs.append(
-                "Crawler permissions are **narrower** than before. "
-                "Expect some assets to become inaccessible. "
-                "Widen permissions or accept the reduced scope before cutover."
-            )
-        if not cfg.same_metastore:
-            recs.append(
-                "Metastore is changing alongside the hostname. "
-                "Verify that Unity Catalog metastore ID and filters are "
-                "updated correctly — mismatches can cause asset loss."
-            )
-        recs.append(
-            "Confirm that Unity Catalog metastore ID, filters, and "
-            "deny-list rules are unchanged after the URL swap."
+            "This migration is rated **Medium risk**. Review the blast radius "
+            "carefully and ensure key stakeholders are aware before proceeding."
         )
 
-    elif change == CHANGE_TYPES[1]:
-        # Point existing connection to new workspace
+    # -- Scenario-specific advice ----------------------------------------------
+    if scenario == SCENARIOS[0]:
         recs.append(
-            "Re-pointing the existing connection will "
-            "**archive assets not present in the new workspace**. "
-            "Prefer going directly to the final workspace to avoid churn."
+            "Confirm same metastore and same crawler filters before making the "
+            "hostname change."
         )
-        if cfg.interim_workspace:
+        recs.append(
+            "Run a small test crawl (1–2 catalogs) against the new hostname "
+            "first to verify connectivity and permissions."
+        )
+        recs.append(
+            "Have a rollback plan ready: revert the hostname in the crawler "
+            "configuration if the test crawl reveals problems."
+        )
+
+    elif scenario == SCENARIOS[1]:
+        recs.append(
+            "Re-pointing the existing connection will **archive everything "
+            "not present in the new workspace**. Understand exactly which "
+            "assets will disappear."
+        )
+        if cfg.interim_subset:
             recs.append(
-                "The new workspace contains a strict subset of the "
-                "final catalogs. Consider creating a **separate temporary "
-                "connection** for the interim period instead of re-pointing "
-                "the production connection."
+                "**Avoid repointing to an interim workspace** with a strict "
+                "subset of the final catalogs if possible. Instead, repoint "
+                "directly from the old workspace to the final workspace when "
+                "ready. If interim is unavoidable, document which assets will "
+                "disappear and socialize that with downstream users."
             )
-        if not cfg.same_metastore:
+        else:
             recs.append(
-                "Metastore is also changing. This significantly increases "
-                "risk — assets may get new qualified names and lose "
-                "enrichment. Plan an enrichment migration."
+                "Prefer repointing directly to the **final** workspace to "
+                "avoid multiple rounds of archive churn."
             )
+        recs.append(
+            "Take an asset-export or MDLH extract of key enriched assets "
+            "(tags, descriptions, owners) before making the change."
+        )
         recs.append(
             "Document which assets will be temporarily archived and set "
             "expectations with downstream consumers before cutover."
         )
-
-    elif change == CHANGE_TYPES[2]:
-        # New connection
-        if cfg.same_metastore:
+        if not cfg.same_metastore:
             recs.append(
-                "Creating a new connection with the **same metastore** will "
-                "cause **duplicate assets** under different qualified names. "
-                "Enrichment (tags, descriptions, owners) will remain on the "
-                "old assets only."
-            )
-            recs.append(
-                "Plan an **enrichment migration** using Atlan's asset-export/"
-                "import or the MDLH pipeline to transfer metadata from the "
-                "old connection to the new one."
-            )
-            recs.append(
-                "After enrichment migration, archive or soft-delete the old "
-                "connection's assets to avoid confusion."
-            )
-        else:
-            recs.append(
-                "New connection + new metastore means Atlan will treat all "
-                "assets as **brand-new entities**. Lineage continuity will "
-                "break unless you plan explicit qualified-name mappings."
-            )
-            recs.append(
-                "Run a **small-scale test crawl** (1-2 catalogs) on the new "
-                "workspace and compare asset counts and critical-asset "
-                "coverage before the full cutover."
-            )
-            recs.append(
-                "Use Atlan's **bulk enrichment migration** (export from old, "
-                "remap qualified names, import to new) to preserve tags, "
-                "classifications, and ownership."
+                "Metastore is also changing — assets may get new qualified "
+                "names and lose enrichment. Plan an enrichment migration."
             )
 
-    # -- Always-on closing recommendation ------------------------------------
+    elif scenario == SCENARIOS[2]:
+        recs.append(
+            "This approach is safer from a \"loss\" perspective (existing "
+            "assets stay in place) but can cause **duplicates and split "
+            "enrichment** if the old and new connections overlap."
+        )
+        recs.append(
+            "Run the new connection in parallel in non-prod or as a separate "
+            "connection first. Validate asset counts and coverage before "
+            "making it the primary connection."
+        )
+        recs.append(
+            "Use asset-export / MDLH to map enrichment from old to new "
+            "qualified names if needed."
+        )
+        recs.append(
+            "Plan a deprecation/cleanup phase: lock or retire the old "
+            "connection, then archive or hide legacy assets once users have "
+            "moved to the new connection."
+        )
+
+    # -- Closing recommendation ------------------------------------------------
     recs.append(
-        "Re-run this simulation after each migration phase to confirm "
-        "the blast radius is narrowing as expected."
+        "Re-run this simulation after each migration phase to confirm the "
+        "blast radius is narrowing as expected."
     )
 
     return recs
@@ -432,23 +443,24 @@ def simulate(cfg: MigrationConfig) -> ImpactResult:
 
     Orchestrates: asset-count estimation -> scoring -> summary -> recommendations.
     """
-    archived, duplicated, preserved = _compute_asset_counts(cfg)
-    direct, transitive, overall = _compute_scores(cfg, archived, duplicated)
-    level = _risk_level(overall)
-
-    total_affected = archived + duplicated
-    affected_groups = _build_affected_groups(total_affected, cfg.high_criticality_pct)
+    archived, duplicated, preserved, notes = _compute_asset_counts(cfg)
+    risk_score, direct_score, transitive_score = _compute_scores(
+        cfg, archived, duplicated,
+    )
+    level = _risk_level(risk_score)
+    affected_groups = _build_affected_groups(archived, duplicated, preserved)
 
     result = ImpactResult(
-        estimated_archived_assets=archived,
-        estimated_duplicated_assets=duplicated,
-        estimated_preserved_assets=preserved,
-        direct_impact_score=direct,
-        transitive_impact_score=transitive,
-        overall_risk_score=overall,
+        archived_assets=archived,
+        duplicated_assets=duplicated,
+        preserved_assets=preserved,
+        risk_score=risk_score,
+        direct_impact_score=direct_score,
+        transitive_impact_score=transitive_score,
         risk_level=level,
+        notes=notes,
         affected_groups=affected_groups,
-        change_type_label=CHANGE_TYPE_LABELS.get(cfg.change_type, cfg.change_type),
+        scenario_label=SCENARIO_LABELS.get(cfg.scenario, cfg.scenario),
         customer_notes=cfg.customer_notes,
     )
 

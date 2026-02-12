@@ -9,10 +9,9 @@ Run with:  streamlit run migration_app.py
 
 import streamlit as st
 from migration_engine import (
-    CHANGE_TYPES,
-    ENVIRONMENTS,
+    SCENARIOS,
     PERMISSION_OPTIONS,
-    ImpactResult,
+    RECOVERY_STEPS,
     MigrationConfig,
     simulate,
 )
@@ -40,10 +39,9 @@ st.markdown(
         font-size: 1rem;
         margin-bottom: 8px;
     }
-    .risk-critical { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
-    .risk-high     { background: #fff7ed; color: #9a3412; border: 1px solid #fdba74; }
-    .risk-medium   { background: #fefce8; color: #854d0e; border: 1px solid #fde047; }
-    .risk-low      { background: #f0fdf4; color: #166534; border: 1px solid #86efac; }
+    .risk-high   { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+    .risk-medium { background: #fefce8; color: #854d0e; border: 1px solid #fde047; }
+    .risk-low    { background: #f0fdf4; color: #166534; border: 1px solid #86efac; }
 
     .impact-chip {
         display: inline-block;
@@ -54,10 +52,9 @@ st.markdown(
         margin-right: 12px;
         margin-bottom: 8px;
     }
-    .chip-critical { background: #fee2e2; color: #991b1b; }
-    .chip-high     { background: #fff7ed; color: #9a3412; }
-    .chip-medium   { background: #fefce8; color: #854d0e; }
-    .chip-low      { background: #f0fdf4; color: #166534; }
+    .chip-high   { background: #fee2e2; color: #991b1b; }
+    .chip-medium { background: #fefce8; color: #854d0e; }
+    .chip-low    { background: #f0fdf4; color: #166534; }
 
     .score-ring {
         font-size: 3rem;
@@ -91,19 +88,16 @@ st.divider()
 # Helpers
 # ---------------------------------------------------------------------------
 RISK_CSS = {
-    "Critical": "risk-critical",
     "High": "risk-high",
     "Medium": "risk-medium",
     "Low": "risk-low",
 }
 RISK_COLOR = {
-    "Critical": "#dc2626",
-    "High": "#ea580c",
+    "High": "#dc2626",
     "Medium": "#ca8a04",
     "Low": "#16a34a",
 }
 CHIP_CSS = {
-    "Critical": "chip-critical",
     "High": "chip-high",
     "Medium": "chip-medium",
     "Low": "chip-low",
@@ -115,12 +109,10 @@ def _risk_badge_html(level: str) -> str:
     return f'<span class="risk-badge {css}">{level} Risk</span>'
 
 
-def _chip_html(label: str, score: float) -> str:
-    if score >= 75:
-        lvl = "Critical"
-    elif score >= 50:
+def _chip_html(label: str, score: int) -> str:
+    if score > 60:
         lvl = "High"
-    elif score >= 25:
+    elif score >= 30:
         lvl = "Medium"
     else:
         lvl = "Low"
@@ -151,42 +143,32 @@ with col_input:
         format="%d",
     )
 
-    environment = st.selectbox("Environment", ENVIRONMENTS)
-
-    high_crit_pct = st.slider(
-        "% of assets tagged as high-criticality",
-        min_value=0,
-        max_value=100,
-        value=15,
-    )
+    is_prod = st.radio(
+        "Is this a production tenant?",
+        [
+            "Yes – Production / Business Critical",
+            "No – Non-prod / Sandbox",
+        ],
+        horizontal=True,
+    ) == "Yes – Production / Business Critical"
 
     st.markdown("---")
 
     # --- Planned migration --------------------------------------------------
     st.markdown("##### Planned Migration")
 
-    change_type = st.selectbox("Migration scenario", CHANGE_TYPES)
+    scenario = st.selectbox("Migration scenario", SCENARIOS)
 
-    # --- Contextual options based on selected scenario ----------------------
     same_metastore = st.radio(
         "Will the Unity Catalog metastore stay the same?",
         ["Yes", "No"],
         horizontal=True,
     ) == "Yes"
 
-    # Reuse connection is derived from the scenario (not a user choice)
-    if change_type == CHANGE_TYPES[0]:
-        # Hostname update → always reusing the same connection
-        reuse_connection = True
-    elif change_type == CHANGE_TYPES[1]:
-        # Point existing connection → always reusing it
-        reuse_connection = True
-    else:
-        # New connection → by definition not reusing
-        reuse_connection = False
+    # --- Contextual inputs based on scenario --------------------------------
 
-    # Show asset estimate for scenarios where the workspace changes
-    if change_type in (CHANGE_TYPES[1], CHANGE_TYPES[2]):
+    # New assets at cutover: relevant when workspace changes
+    if scenario in (SCENARIOS[1], SCENARIOS[2]):
         new_assets = st.number_input(
             "Estimated assets in new workspace at cutover",
             min_value=0,
@@ -198,23 +180,44 @@ with col_input:
     else:
         new_assets = current_assets
 
+    # Overlap slider: only for "Create new connection" scenario
+    overlap_pct: float | None = None
+    if scenario == SCENARIOS[2]:
+        overlap_raw = st.slider(
+            "Approx. % of existing assets that will also appear in the new workspace",
+            min_value=0,
+            max_value=100,
+            value=60,
+            help=(
+                "Duplicated assets = assets that may appear twice (old + new "
+                "connection) until you clean up enrichment."
+            ),
+        )
+        overlap_pct = overlap_raw / 100.0
+
+    # Interim workspace flag: only for "Point existing connection" scenario
+    interim_subset = False
+    if scenario == SCENARIOS[1]:
+        interim_subset = st.checkbox(
+            "This workspace is an interim workspace with a strict subset of the final catalogs",
+            help=(
+                "If checked, the simulator treats archived assets as temporary "
+                "but high-risk — downstream users will lose visibility until "
+                "the final workspace is connected."
+            ),
+        )
+
+    # Crawler permissions — small modifier
     crawler_perms = st.selectbox(
         "Crawler credential permissions",
         PERMISSION_OPTIONS,
         format_func=lambda x: x.capitalize(),
+        help="How do the crawler's permissions on the new workspace compare to the old one?",
     )
-
-    # Interim workspace only relevant when re-pointing an existing connection
-    if change_type == CHANGE_TYPES[1]:
-        interim_workspace = st.checkbox(
-            "Interim workspace with a strict subset of the final catalogs"
-        )
-    else:
-        interim_workspace = False
 
     st.markdown("---")
 
-    # --- Optional qualitative -----------------------------------------------
+    # --- Optional notes -----------------------------------------------------
     st.markdown("##### Notes")
     customer_notes = st.text_area(
         "Notes for customer (optional)",
@@ -237,13 +240,12 @@ with col_results:
         cfg = MigrationConfig(
             current_assets=current_assets,
             new_assets=new_assets,
-            change_type=change_type,
-            environment=environment,
-            high_criticality_pct=float(high_crit_pct),
+            scenario=scenario,
             same_metastore=same_metastore,
-            reuse_connection=reuse_connection,
+            is_prod=is_prod,
+            overlap_pct=overlap_pct,
             crawler_perms=crawler_perms,
-            interim_workspace=interim_workspace,
+            interim_subset=interim_subset,
             customer_notes=customer_notes,
         )
 
@@ -256,20 +258,28 @@ with col_results:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(
             "Archived Assets",
-            f"{result.estimated_archived_assets:,}",
+            f"{result.archived_assets:,}",
+            help=(
+                "Archived assets = assets that may disappear from Atlan's "
+                "catalog after the migration because they're no longer "
+                "present in the new workspace."
+            ),
         )
         m2.metric(
             "Duplicated Assets",
-            f"{result.estimated_duplicated_assets:,}",
+            f"{result.duplicated_assets:,}",
+            help=(
+                "Duplicated assets = assets that may appear twice (old + new "
+                "connection) until you clean up enrichment."
+            ),
         )
         m3.metric(
             "Preserved Assets",
-            f"{result.estimated_preserved_assets:,}",
+            f"{result.preserved_assets:,}",
         )
-        # Overall risk score with colored label
         m4.metric(
             "Risk Score",
-            f"{result.overall_risk_score}/100",
+            f"{result.risk_score}/100",
         )
 
         st.divider()
@@ -282,7 +292,7 @@ with col_results:
             color = RISK_COLOR.get(result.risk_level, "#64748b")
             st.markdown(
                 f'<p class="score-ring" style="color:{color}">'
-                f"{result.overall_risk_score}</p>",
+                f"{result.risk_score}</p>",
                 unsafe_allow_html=True,
             )
             st.markdown(
@@ -320,17 +330,27 @@ with col_results:
 
         st.divider()
 
+        # -- If something goes wrong -----------------------------------------
+        st.markdown("#### If something goes wrong during migration")
+        for step in RECOVERY_STEPS:
+            st.markdown(f"- {step}")
+
+        st.divider()
+
         # -- Affected Asset Groups -------------------------------------------
-        st.markdown("#### Affected Asset Groups (mocked)")
-        for group in result.affected_groups:
-            st.markdown(
-                f'<div class="asset-group-card">'
-                f"<strong>{group.asset_type}</strong>"
-                f" &nbsp;·&nbsp; ~{group.estimated_count:,} affected"
-                f" &nbsp;·&nbsp; {group.pct_high_criticality}% high-criticality"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown("#### Affected Asset Groups (estimated)")
+        if any(g.estimated_count > 0 for g in result.affected_groups):
+            for group in result.affected_groups:
+                if group.estimated_count > 0:
+                    st.markdown(
+                        f'<div class="asset-group-card">'
+                        f"<strong>{group.asset_type}</strong>"
+                        f" &nbsp;·&nbsp; ~{group.estimated_count:,} affected"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+        else:
+            st.info("No assets are expected to be directly affected.")
 
     else:
         st.info(
