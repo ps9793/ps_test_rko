@@ -167,32 +167,36 @@ with col_input:
 
     change_type = st.selectbox("Migration scenario", CHANGE_TYPES)
 
+    # --- Contextual options based on selected scenario ----------------------
     same_metastore = st.radio(
         "Will the Unity Catalog metastore stay the same?",
         ["Yes", "No"],
         horizontal=True,
     ) == "Yes"
 
-    same_workspace_url = st.radio(
-        "Will the workspace URL stay the same?",
-        ["Same", "Different"],
-        horizontal=True,
-    ) == "Same"
+    # Reuse connection is derived from the scenario (not a user choice)
+    if change_type == CHANGE_TYPES[0]:
+        # Hostname update → always reusing the same connection
+        reuse_connection = True
+    elif change_type == CHANGE_TYPES[1]:
+        # Point existing connection → always reusing it
+        reuse_connection = True
+    else:
+        # New connection → by definition not reusing
+        reuse_connection = False
 
-    reuse_connection = st.radio(
-        "Will you reuse the same Atlan connection?",
-        ["Yes", "No"],
-        horizontal=True,
-    ) == "Yes"
-
-    new_assets = st.number_input(
-        "Estimated assets in new workspace at cutover",
-        min_value=0,
-        max_value=50_000_000,
-        value=current_assets,
-        step=10_000,
-        format="%d",
-    )
+    # Show asset estimate for scenarios where the workspace changes
+    if change_type in (CHANGE_TYPES[1], CHANGE_TYPES[2]):
+        new_assets = st.number_input(
+            "Estimated assets in new workspace at cutover",
+            min_value=0,
+            max_value=50_000_000,
+            value=current_assets,
+            step=10_000,
+            format="%d",
+        )
+    else:
+        new_assets = current_assets
 
     crawler_perms = st.selectbox(
         "Crawler credential permissions",
@@ -200,9 +204,13 @@ with col_input:
         format_func=lambda x: x.capitalize(),
     )
 
-    interim_workspace = st.checkbox(
-        "Interim workspace with a strict subset of the final catalogs"
-    )
+    # Interim workspace only relevant when re-pointing an existing connection
+    if change_type == CHANGE_TYPES[1]:
+        interim_workspace = st.checkbox(
+            "Interim workspace with a strict subset of the final catalogs"
+        )
+    else:
+        interim_workspace = False
 
     st.markdown("---")
 
@@ -233,7 +241,6 @@ with col_results:
             environment=environment,
             high_criticality_pct=float(high_crit_pct),
             same_metastore=same_metastore,
-            same_workspace_url=same_workspace_url,
             reuse_connection=reuse_connection,
             crawler_perms=crawler_perms,
             interim_workspace=interim_workspace,

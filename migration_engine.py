@@ -18,20 +18,16 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 CHANGE_TYPES = [
-    "Update hostname/URL on existing connection (same metastore)",
-    "Point existing connection to interim workspace with smaller estate",
-    "Create new Databricks connection for new workspace (same metastore)",
-    "Migrate to new account + new metastore",
-    "Complex / multi-workspace migration",
+    "Update hostname in existing connection",
+    "Point existing connection to new workspace",
+    "Create new Databricks connection for new workspace",
 ]
 
 # Short labels used in the UI and summary text
 CHANGE_TYPE_LABELS: dict[str, str] = {
     CHANGE_TYPES[0]: "Hostname update",
-    CHANGE_TYPES[1]: "Interim workspace",
-    CHANGE_TYPES[2]: "New connection (same metastore)",
-    CHANGE_TYPES[3]: "New account + metastore",
-    CHANGE_TYPES[4]: "Complex migration",
+    CHANGE_TYPES[1]: "Re-point existing connection",
+    CHANGE_TYPES[2]: "New connection",
 }
 
 ENVIRONMENTS = ["Prod", "Non-prod", "Mixed"]
@@ -40,10 +36,8 @@ PERMISSION_OPTIONS = ["same", "broader", "narrower"]
 # Base risk multipliers per scenario (0.0–1.0 scale)
 SCENARIO_BASE_RISK: dict[str, float] = {
     CHANGE_TYPES[0]: 0.15,  # hostname only — low structural risk
-    CHANGE_TYPES[1]: 0.70,  # interim workspace — high archive risk
-    CHANGE_TYPES[2]: 0.60,  # new connection — duplication risk
-    CHANGE_TYPES[3]: 0.85,  # new account+metastore — maximum structural change
-    CHANGE_TYPES[4]: 0.90,  # complex — highest baseline
+    CHANGE_TYPES[1]: 0.55,  # re-point — moderate, depends on workspace delta
+    CHANGE_TYPES[2]: 0.70,  # new connection — duplication + migration risk
 }
 
 # Mocked asset-type distribution (% of total estate)
@@ -70,8 +64,7 @@ class MigrationConfig:
     environment: str  # "Prod" | "Non-prod" | "Mixed"
     high_criticality_pct: float  # 0–100
     same_metastore: bool
-    same_workspace_url: bool
-    reuse_connection: bool
+    reuse_connection: bool  # derived from change_type in UI
     crawler_perms: str  # "same" | "broader" | "narrower"
     interim_workspace: bool  # True if strict subset of final catalogs
     customer_notes: str = ""
@@ -144,50 +137,43 @@ def _compute_asset_counts(cfg: MigrationConfig) -> tuple[int, int, int]:
     duplicated = 0
     preserved = current  # optimistic default
 
-    # --- Scenario 1: Hostname update, same metastore, reuse connection ------
+    # --- Scenario 1: Update hostname in existing connection -----------------
     if change == CHANGE_TYPES[0]:
-        # If filters & perms are identical, everything is preserved.
+        # Same connection, just URL change. Low risk unless perms narrower.
         if cfg.crawler_perms == "narrower":
-            # Narrower perms may cause some assets to become inaccessible.
             loss_pct = 0.10  # ~10% lost to narrower perms
             archived = int(current * loss_pct)
+        # Metastore change adds some risk even for hostname updates
+        if not cfg.same_metastore:
+            extra_archive = int(current * 0.10)
+            archived = min(archived + extra_archive, current)
         preserved = current - archived
 
-    # --- Scenario 2: Interim workspace with fewer assets --------------------
+    # --- Scenario 2: Point existing connection to new workspace -------------
     elif change == CHANGE_TYPES[1]:
         # Assets in Atlan but not in the new workspace get archived.
         if new < current:
             archived = current - new
         preserved = current - archived
-        # If interim flag is on, add a note but counts stay the same.
+        # Metastore change amplifies risk
+        if not cfg.same_metastore:
+            extra_archive = int(current * 0.15)
+            archived = min(archived + extra_archive, current)
+            preserved = current - archived
 
-    # --- Scenario 3: New connection, same metastore -------------------------
+    # --- Scenario 3: Create new Databricks connection -----------------------
     elif change == CHANGE_TYPES[2]:
-        # Overlapping assets get duplicated under different qualified names.
-        overlap = min(current, new)
-        duplicated = overlap
-        # Nothing is archived from the old connection (it still exists).
-        preserved = current  # old connection untouched
-        # But effectively, the NEW connection creates duplicated copies.
-
-    # --- Scenario 4: New account + new metastore ----------------------------
-    elif change == CHANGE_TYPES[3]:
-        # Maximum structural change — almost nothing auto-preserved.
-        preserved_pct = 0.05  # only ~5% might survive via manual mapping
         if cfg.same_metastore:
-            preserved_pct = 0.30  # user contradicted the scenario; be gentler
-        preserved = int(current * preserved_pct)
-        archived = current - preserved
-        # Duplication if they also keep the old connection running.
-        if not cfg.reuse_connection:
+            # Same metastore → duplication from overlapping assets
+            overlap = min(current, new)
+            duplicated = overlap
+            preserved = current  # old connection untouched
+        else:
+            # Different metastore → maximum structural change
+            preserved_pct = 0.05
+            preserved = int(current * preserved_pct)
+            archived = current - preserved
             duplicated = new  # new connection creates a parallel set
-
-    # --- Scenario 5: Complex / multi-workspace ------------------------------
-    elif change == CHANGE_TYPES[4]:
-        # High baseline — assume partial archive + partial duplication.
-        archived = int(current * 0.30)
-        duplicated = int(min(current, new) * 0.40)
-        preserved = current - archived
 
     # --- Permissions modifier (across all scenarios) ------------------------
     if cfg.crawler_perms == "narrower" and change != CHANGE_TYPES[0]:
@@ -351,82 +337,76 @@ def _generate_recommendations(
                 "Expect some assets to become inaccessible. "
                 "Widen permissions or accept the reduced scope before cutover."
             )
+        if not cfg.same_metastore:
+            recs.append(
+                "Metastore is changing alongside the hostname. "
+                "Verify that Unity Catalog metastore ID and filters are "
+                "updated correctly — mismatches can cause asset loss."
+            )
         recs.append(
             "Confirm that Unity Catalog metastore ID, filters, and "
             "deny-list rules are unchanged after the URL swap."
         )
 
     elif change == CHANGE_TYPES[1]:
-        # Interim workspace
+        # Point existing connection to new workspace
         recs.append(
-            "Updating the existing connection to an interim workspace will "
-            "**archive assets not present in the smaller estate**. "
-            "Prefer going directly from the old workspace to the final "
-            "workspace to avoid churn."
+            "Re-pointing the existing connection will "
+            "**archive assets not present in the new workspace**. "
+            "Prefer going directly to the final workspace to avoid churn."
         )
         if cfg.interim_workspace:
             recs.append(
-                "The interim workspace contains a strict subset of the "
+                "The new workspace contains a strict subset of the "
                 "final catalogs. Consider creating a **separate temporary "
                 "connection** for the interim period instead of re-pointing "
                 "the production connection."
             )
+        if not cfg.same_metastore:
+            recs.append(
+                "Metastore is also changing. This significantly increases "
+                "risk — assets may get new qualified names and lose "
+                "enrichment. Plan an enrichment migration."
+            )
         recs.append(
-            "If you must use the interim workspace, document which assets "
-            "will be temporarily archived and set expectations with "
-            "downstream consumers."
+            "Document which assets will be temporarily archived and set "
+            "expectations with downstream consumers before cutover."
         )
 
     elif change == CHANGE_TYPES[2]:
-        # New connection, same metastore
-        recs.append(
-            "Creating a new Atlan connection will cause **duplicate assets** "
-            "under different qualified names. Enrichment (tags, descriptions, "
-            "owners) will remain on the old assets only."
-        )
-        recs.append(
-            "Plan an **enrichment migration** using Atlan's asset-export/"
-            "import or the MDLH pipeline to transfer metadata from the "
-            "old connection to the new one."
-        )
-        recs.append(
-            "After enrichment migration, archive or soft-delete the old "
-            "connection's assets to avoid confusion."
-        )
-
-    elif change == CHANGE_TYPES[3]:
-        # New account + new metastore
-        recs.append(
-            "New account + new metastore means Atlan will treat all assets "
-            "as **brand-new entities**. Lineage continuity will break unless "
-            "you plan explicit qualified-name mappings."
-        )
-        recs.append(
-            "Run a **small-scale test crawl** (1-2 catalogs) on the new "
-            "account and compare asset counts and critical-asset coverage "
-            "before the full cutover."
-        )
-        recs.append(
-            "Use Atlan's **bulk enrichment migration** (export from old, "
-            "remap qualified names, import to new) to preserve tags, "
-            "classifications, and ownership."
-        )
-
-    elif change == CHANGE_TYPES[4]:
-        # Complex / multi-workspace
-        recs.append(
-            "Complex multi-workspace migrations carry the **highest risk "
-            "of both duplication and data loss**. Break the migration into "
-            "phases and simulate each phase independently."
-        )
-        recs.append(
-            "Maintain a **connection mapping spreadsheet** that tracks "
-            "old-workspace-to-new-workspace asset correspondence."
-        )
-        recs.append(
-            "Consider using Atlan's **MDLH GOLD layer** to reconcile "
-            "assets across workspaces after migration."
-        )
+        # New connection
+        if cfg.same_metastore:
+            recs.append(
+                "Creating a new connection with the **same metastore** will "
+                "cause **duplicate assets** under different qualified names. "
+                "Enrichment (tags, descriptions, owners) will remain on the "
+                "old assets only."
+            )
+            recs.append(
+                "Plan an **enrichment migration** using Atlan's asset-export/"
+                "import or the MDLH pipeline to transfer metadata from the "
+                "old connection to the new one."
+            )
+            recs.append(
+                "After enrichment migration, archive or soft-delete the old "
+                "connection's assets to avoid confusion."
+            )
+        else:
+            recs.append(
+                "New connection + new metastore means Atlan will treat all "
+                "assets as **brand-new entities**. Lineage continuity will "
+                "break unless you plan explicit qualified-name mappings."
+            )
+            recs.append(
+                "Run a **small-scale test crawl** (1-2 catalogs) on the new "
+                "workspace and compare asset counts and critical-asset "
+                "coverage before the full cutover."
+            )
+            recs.append(
+                "Use Atlan's **bulk enrichment migration** (export from old, "
+                "remap qualified names, import to new) to preserve tags, "
+                "classifications, and ownership."
+            )
 
     # -- Always-on closing recommendation ------------------------------------
     recs.append(
